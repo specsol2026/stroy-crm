@@ -1,0 +1,178 @@
+name: Напоминания СтройУчёт
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # каждые 5 минут
+  workflow_dispatch:          # можно запустить вручную для теста
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Проверить события и отправить напоминания
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          node -e "
+          const https = require('https');
+
+          const TG_TOKEN = process.env.TG_TOKEN;
+          const TG_CHAT_ID = process.env.TG_CHAT_ID;
+          const FIREBASE_URL = 'firestore.googleapis.com';
+          const FIREBASE_PATH = '/v1/projects/specsol-crm/databases/(default)/documents/crm/data';
+
+          // Получаем данные из Firebase
+          function getFirebaseData() {
+            return new Promise((resolve, reject) => {
+              const req = https.get({ hostname: FIREBASE_URL, path: FIREBASE_PATH }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); }
+                  catch(e) { reject(e); }
+                });
+              });
+              req.on('error', reject);
+              req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+            });
+          }
+
+          // Отправить сообщение в Telegram
+          function sendTelegram(text) {
+            return new Promise((resolve) => {
+              const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown' });
+              const req = https.request({
+                hostname: 'api.telegram.org',
+                path: '/bot' + TG_TOKEN + '/sendMessage',
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+              }, (res) => {
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => { console.log('TG response:', d.substring(0, 100)); resolve(); });
+              });
+              req.on('error', e => { console.error('TG error:', e.message); resolve(); });
+              req.write(body);
+              req.end();
+            });
+          }
+
+          // Проверить не было ли уже отправлено (через Firebase флаг)
+          function setReminded(key) {
+            return new Promise((resolve) => {
+              const body = JSON.stringify({
+                fields: { [key]: { booleanValue: true } }
+              });
+              const req = https.request({
+                hostname: FIREBASE_URL,
+                path: FIREBASE_PATH.replace('/crm/data', '/crm/reminded') + '?updateMask.fieldPaths=' + key,
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+              }, () => resolve());
+              req.on('error', () => resolve());
+              req.write(body);
+              req.end();
+            });
+          }
+
+          function getReminded() {
+            return new Promise((resolve) => {
+              https.get({ hostname: FIREBASE_URL, path: FIREBASE_PATH.replace('/crm/data', '/crm/reminded') }, (res) => {
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => {
+                  try {
+                    const doc = JSON.parse(d);
+                    const fields = doc.fields || {};
+                    const result = {};
+                    Object.keys(fields).forEach(k => { result[k] = true; });
+                    resolve(result);
+                  } catch(e) { resolve({}); }
+                });
+              }).on('error', () => resolve({}));
+            });
+          }
+
+          async function main() {
+            if (!TG_TOKEN || !TG_CHAT_ID) {
+              console.log('TG_TOKEN or TG_CHAT_ID not set, skipping');
+              return;
+            }
+
+            console.log('Checking reminders at', new Date().toISOString());
+
+            let firebaseData, reminded;
+            try {
+              [firebaseData, reminded] = await Promise.all([getFirebaseData(), getReminded()]);
+            } catch(e) {
+              console.error('Failed to fetch data:', e.message);
+              return;
+            }
+
+            // Извлечь plan из Firebase документа
+            const fields = firebaseData.fields || {};
+            const planField = fields.plan;
+            if (!planField || !planField.arrayValue) {
+              console.log('No plan data found');
+              return;
+            }
+
+            const planItems = planField.arrayValue.values || [];
+            const now = new Date();
+            let sent = 0;
+
+            for (const item of planItems) {
+              const f = item.mapValue?.fields || {};
+              const id = f.id?.stringValue;
+              const title = f.title?.stringValue;
+              const dt = f.dt?.stringValue;
+              const time = f.time?.stringValue;
+              const remind = f.remind?.stringValue || f.remind?.integerValue;
+              const participants = f.participants?.stringValue || '';
+              const desc = f.desc?.stringValue || '';
+              const cat = f.cat?.stringValue || '';
+
+              if (!id || !title || !dt || !time || !remind) continue;
+
+              const remindMin = parseInt(remind);
+              if (!remindMin) continue;
+
+              const eventDate = new Date(dt + 'T' + time);
+              const diffMin = (eventDate - now) / 60000;
+
+              const key = 'r_' + id + '_' + remind;
+
+              // Срабатывает в окне от remindMin до remindMin-6 минут
+              // (проверка каждые 5 мин, окно 6 мин для надёжности)
+              if (diffMin <= remindMin && diffMin > remindMin - 6 && !reminded[key]) {
+                const catLabels = { meet: 'Встреча', task: 'Задача', call: 'Звонок', deadline: 'Дедлайн', other: 'Прочее' };
+                const remindLabels = { '5':'за 5 минут', '15':'за 15 минут', '30':'за 30 минут', '60':'за 1 час', '1440':'за 1 день' };
+                const remindLabel = remindLabels[String(remindMin)] || 'напоминание';
+                const catLabel = catLabels[cat] || '';
+
+                const dateFormatted = dt.split('-').reverse().join('.');
+                const timeFormatted = time.slice(0, 5);
+
+                let text = '📅 *Напоминание — ' + remindLabel + '*\n';
+                text += '*' + title + '*\n';
+                text += '🕐 ' + dateFormatted + ' в ' + timeFormatted;
+                if (catLabel) text += '  ·  ' + catLabel;
+                if (participants) text += '\n👥 ' + participants;
+                if (desc) text += '\n📝 ' + desc;
+
+                console.log('Sending reminder for:', title, '(diffMin:', diffMin.toFixed(1), ')');
+                await sendTelegram(text);
+                await setReminded(key);
+                sent++;
+
+                // Пауза между сообщениями
+                if (sent > 1) await new Promise(r => setTimeout(r, 1000));
+              }
+            }
+
+            console.log('Done. Sent:', sent, 'reminders');
+          }
+
+          main().catch(e => { console.error('Fatal:', e); process.exit(1); });
+          "
